@@ -1,5 +1,0 @@
-streamlit
-pillow
-numpy
-pytesseract
-pymupdf
