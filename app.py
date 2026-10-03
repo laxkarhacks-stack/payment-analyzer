@@ -8,7 +8,10 @@ import re
 import sqlite3
 from datetime import datetime
 
-import fitz  # PyMuPDF
+try:
+    import pymupdf as fitz  # PyMuPDF (naya naam)
+except ImportError:
+    import fitz  # purane versions
 import numpy as np
 import pytesseract
 import streamlit as st
@@ -23,18 +26,26 @@ MONTHS = {m: i for i, m in enumerate(
 
 
 # ---------------------------------------------------------------- loading
+MAX_PAGES = 20  # cloud memory/time bachane ke liye
+
+
 def load_file(data: bytes, name: str):
-    """Return (PIL image, text, metadata dict, kind)."""
-    meta, text = {}, ""
+    """Return ([(PIL image, text), ...] one entry per page, metadata dict, kind)."""
+    meta = {}
     if name.lower().endswith(".pdf"):
         doc = fitz.open(stream=data, filetype="pdf")
         meta = {k: v for k, v in (doc.metadata or {}).items() if v}
-        text = "\n".join(p.get_text() for p in doc)
-        pix = doc[0].get_pixmap(dpi=200)
-        img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-        if len(text.strip()) < 30:  # scanned / image-only PDF
-            text = pytesseract.image_to_string(img)
-        return img, text, meta, "pdf"
+        pages = []
+        for p in doc:
+            if len(pages) >= MAX_PAGES:
+                break
+            pix = p.get_pixmap(dpi=200)
+            img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+            text = p.get_text()
+            if len(text.strip()) < 30:  # scanned / image-only page
+                text = pytesseract.image_to_string(img)
+            pages.append((img, text))
+        return pages, meta, "pdf"
     img = Image.open(io.BytesIO(data))
     try:
         exif = img.getexif()
@@ -44,7 +55,7 @@ def load_file(data: bytes, name: str):
         pass
     img = img.convert("RGB")
     text = pytesseract.image_to_string(img)
-    return img, text, meta, "image"
+    return [(img, text)], meta, "image"
 
 
 # ---------------------------------------------------------------- helpers
@@ -120,22 +131,23 @@ def sha(data):
 
 # ---------------------------------------------------------------- checks
 # each check returns (name, status, weight, detail); status: pass/warn/fail/info
-def run_checks(img, text, meta, kind, data, record):
+def run_checks(img, text, meta, kind, data, page=1):
     R = []
     add = lambda n, s, w, d: R.append((n, s, w, d))
     today = datetime.now().date()
 
-    # 1. metadata / editing software
-    blob = " ".join(f"{k}={v}" for k, v in meta.items()).lower()
-    hit = [w for w in EDITOR_WORDS if w in blob]
-    if hit:
-        add("Metadata: editing software", "fail", 35, f"Editor ka naam mila: {', '.join(hit)}")
-    else:
-        add("Metadata: editing software", "pass" if meta else "info", 0,
-            "Koi editor nahi mila" if meta else "Metadata nahi mila (WhatsApp se hat jata hai)")
-    if kind == "pdf" and meta.get("creationDate") and meta.get("modDate") \
-            and meta["creationDate"] != meta["modDate"]:
-        add("PDF: creation vs modified time", "warn", 15, "Dono time alag hain (file baad me modify hui)")
+    # 1. metadata / editing software (file-level, sirf pehle page ke saath)
+    if page == 1:
+        blob = " ".join(f"{k}={v}" for k, v in meta.items()).lower()
+        hit = [w for w in EDITOR_WORDS if w in blob]
+        if hit:
+            add("Metadata: editing software", "fail", 35, f"Editor ka naam mila: {', '.join(hit)}")
+        else:
+            add("Metadata: editing software", "pass" if meta else "info", 0,
+                "Koi editor nahi mila" if meta else "Metadata nahi mila (WhatsApp se hat jata hai)")
+        if kind == "pdf" and meta.get("creationDate") and meta.get("modDate") \
+                and meta["creationDate"] != meta["modDate"]:
+            add("PDF: creation vs modified time", "warn", 15, "Dono time alag hain (file baad me modify hui)")
 
     # 2. dates
     dates = parse_dates(text)
@@ -191,29 +203,37 @@ def run_checks(img, text, meta, kind, data, record):
         add("Amount consistency / math", "pass" if ok else "warn", 0 if ok else 20,
             "Bill + fee = total sahi" if ok else f"Amounts mismatch: {u}")
 
-    # 6. ELA (weak signal, mostly for JPEG)
+    # 6. ELA (weak signal, sirf image files par; PDF render par ELA ka matlab nahi)
     try:
+        if kind != "image":
+            raise ValueError("ELA skip for PDF pages")
         s = ela_score(img)
         add("Image forensics (ELA)", "warn" if s > 6 else "pass", 15 if s > 6 else 0,
             f"Score {s:.1f} - kuch region alag compress hue" if s > 6 else f"Score {s:.1f} normal")
     except Exception:
         pass
 
-    # 7. duplicate
+    # 7. duplicate (record baad me hota hai, taaki ek hi PDF ke pages aapas me duplicate na dikhen)
+    file_key = sha(data) if page == 1 else f"{sha(data)}-p{page}"
+    keys = [("file", file_key)] + [("utr", x) for x in utrs[:1]]
     con = sqlite3.connect(DB)
     con.execute("CREATE TABLE IF NOT EXISTS seen(kind TEXT, val TEXT, ts TEXT, UNIQUE(kind,val))")
-    keys = [("file", sha(data))] + [("utr", x) for x in utrs[:1]]
     dup = [k for k, v in keys if con.execute("SELECT 1 FROM seen WHERE kind=? AND val=?", (k, v)).fetchone()]
+    con.close()
     if dup:
         add("Duplicate check", "fail", 40, "Ye screenshot/UTR pehle bhi use ho chuka hai")
     else:
         add("Duplicate check", "pass", 0, "Pehle nahi dikha")
-    if record:
-        for k, v in keys:
-            con.execute("INSERT OR IGNORE INTO seen VALUES(?,?,?)", (k, v, datetime.now().isoformat()))
-        con.commit()
+    return R, keys
+
+
+def record_seen(keys):
+    con = sqlite3.connect(DB)
+    con.execute("CREATE TABLE IF NOT EXISTS seen(kind TEXT, val TEXT, ts TEXT, UNIQUE(kind,val))")
+    for k, v in keys:
+        con.execute("INSERT OR IGNORE INTO seen VALUES(?,?,?)", (k, v, datetime.now().isoformat()))
+    con.commit()
     con.close()
-    return R
 
 
 def verdict(R):
@@ -234,14 +254,24 @@ record = st.checkbox("Duplicate check ke liye history me save karo", value=True)
 
 if f:
     data = f.getvalue()
-    with st.spinner("Check ho raha hai..."):
-        img, text, meta, kind = load_file(data, f.name)
-        R = run_checks(img, text, meta, kind, data, record)
-    score, msg, level = verdict(R)
-    st.image(img, width=300)
-    getattr(st, level)(f"**{msg}**  \nRisk score: {score}/100")
+    with st.spinner("Check ho raha hai (saare pages)..."):
+        pages, meta, kind = load_file(data, f.name)
+        results = [run_checks(img, text, meta, kind, data, i + 1)
+                   for i, (img, text) in enumerate(pages)]
+        if record:
+            record_seen([k for _, keys in results for k in keys])
+    verdicts = [verdict(R) for R, _ in results]
+    worst = max(range(len(verdicts)), key=lambda i: verdicts[i][0])
+    score, msg, level = verdicts[worst]
+    suffix = f"  \n(Sabse zyada risk Page {worst + 1} par, total {len(pages)} pages scan hue)" if len(pages) > 1 else ""
+    getattr(st, level)(f"**{msg}**  \nRisk score: {score}/100{suffix}")
+    if kind == "pdf" and len(pages) >= MAX_PAGES:
+        st.info(f"Sirf pehle {MAX_PAGES} pages scan kiye gaye.")
     icons = {"pass": "✅", "warn": "⚠️", "fail": "❌", "info": "ℹ️"}
-    st.table([{"": icons[s], "Check": n, "Detail": d} for n, s, _, d in R])
-    with st.expander("OCR text"):
-        st.text(text)
+    for i, ((img, text), (R, _), (sc, vmsg, _)) in enumerate(zip(pages, results, verdicts)):
+        title = f"Page {i + 1}: {vmsg} (risk {sc}/100)" if len(pages) > 1 else "Details"
+        with st.expander(title, expanded=(len(pages) == 1 or i == worst)):
+            st.image(img, width=300)
+            st.table([{"": icons[s], "Check": n, "Detail": d} for n, s, _, d in R])
+            st.text_area("OCR text", text, height=150, key=f"ocr{i}")
     st.caption("Ye sirf risk estimate hai, 100% proof nahi. Asli confirmation bank SMS/app me credit dekhkar hi hota hai.")
